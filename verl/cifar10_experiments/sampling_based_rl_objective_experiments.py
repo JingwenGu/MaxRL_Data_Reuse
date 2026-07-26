@@ -75,13 +75,26 @@ class HFImageNet(torch.utils.data.Dataset):
         return self.ds.features["label"].num_classes
 
 
+def apply_deterministic_transform(img, i, j, h, w, flip, crop_size, to_tensor, normalize):
+    """
+    Applies an exact (already-sampled) RandomResizedCrop + optional horizontal flip,
+    followed by ToTensor + Normalize. Given the same (i, j, h, w, flip) this reproduces
+    byte-identical output to the random-sampling path below, which is what lets saved
+    rollout logs (which store these params, not pixels) reconstruct the exact training
+    input later.
+    """
+    img = TF.resized_crop(img, i, j, h, w, (crop_size, crop_size))
+    if flip:
+        img = TF.hflip(img)
+    return normalize(to_tensor(img))
+
+
 class HFImageNetTrain(torch.utils.data.Dataset):
     """
-    Like HFImageNet, but manually applies the RandomResizedCrop + RandomHorizontalFlip
-    steps (instead of hiding them inside a Compose) so the sampled augmentation params
-    (crop box + flip) can be returned alongside each image. This lets rollout logging
-    record exactly which crop/flip produced a given training input, without having to
-    store the transformed pixel tensor itself.
+    Like HFImageNet, but manually samples the RandomResizedCrop + RandomHorizontalFlip
+    params (instead of hiding them inside a Compose) so they can be returned alongside
+    each image. This lets rollout logging record exactly which crop/flip produced a
+    given training input, without having to store the transformed pixel tensor itself.
     """
     def __init__(self, hf_ds, crop_size, scale, mean, std):
         self.ds = hf_ds["train"]
@@ -99,13 +112,11 @@ class HFImageNetTrain(torch.utils.data.Dataset):
         label = self.ds[idx]["label"]
 
         i, j, h, w = T.RandomResizedCrop.get_params(img, scale=self.scale, ratio=self.ratio)
-        img = TF.resized_crop(img, i, j, h, w, (self.crop_size, self.crop_size))
-
         flip = random.random() < 0.5
-        if flip:
-            img = TF.hflip(img)
 
-        img = self.normalize(self.to_tensor(img))
+        img = apply_deterministic_transform(
+            img, i, j, h, w, flip, self.crop_size, self.to_tensor, self.normalize
+        )
 
         return img, label, idx, i, j, h, w, int(flip)
 
