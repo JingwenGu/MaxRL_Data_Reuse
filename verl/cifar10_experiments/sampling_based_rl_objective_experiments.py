@@ -24,6 +24,7 @@ from torch.optim.lr_scheduler import (
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from torchvision import transforms as T
+from torchvision.transforms import functional as TF
 
 # --- W&B ---
 import wandb
@@ -72,7 +73,42 @@ class HFImageNet(torch.utils.data.Dataset):
     
     def get_num_classes(self) -> int:
         return self.ds.features["label"].num_classes
-            
+
+
+class HFImageNetTrain(torch.utils.data.Dataset):
+    """
+    Like HFImageNet, but manually applies the RandomResizedCrop + RandomHorizontalFlip
+    steps (instead of hiding them inside a Compose) so the sampled augmentation params
+    (crop box + flip) can be returned alongside each image. This lets rollout logging
+    record exactly which crop/flip produced a given training input, without having to
+    store the transformed pixel tensor itself.
+    """
+    def __init__(self, hf_ds, crop_size, scale, mean, std):
+        self.ds = hf_ds["train"]
+        self.crop_size = crop_size
+        self.scale = scale
+        self.ratio = (3.0 / 4.0, 4.0 / 3.0)  # torchvision RandomResizedCrop default
+        self.to_tensor = T.ToTensor()
+        self.normalize = T.Normalize(mean=mean, std=std)
+
+    def __len__(self) -> int:
+        return len(self.ds)
+
+    def __getitem__(self, idx):
+        img = self.ds[idx]["image"]
+        label = self.ds[idx]["label"]
+
+        i, j, h, w = T.RandomResizedCrop.get_params(img, scale=self.scale, ratio=self.ratio)
+        img = TF.resized_crop(img, i, j, h, w, (self.crop_size, self.crop_size))
+
+        flip = random.random() < 0.5
+        if flip:
+            img = TF.hflip(img)
+
+        img = self.normalize(self.to_tensor(img))
+
+        return img, label, idx, i, j, h, w, int(flip)
+
 
 def get_dataloaders(dataset_name, data_dir, batch_size=128, num_workers=4):
     # --------------------
@@ -191,14 +227,16 @@ def get_dataloaders(dataset_name, data_dir, batch_size=128, num_workers=4):
 
         hf_ds = load_dataset("benjamin-paine/imagenet-1k-256x256")
 
-        train_set = HFImageNet(
-            split="train", 
-            transform=train_transform, 
+        train_set = HFImageNetTrain(
             hf_ds=hf_ds,
+            crop_size=224,
+            scale=(0.08, 1.0),
+            mean=mean,
+            std=std,
         )
 
         test_set = HFImageNet(
-            split="validation", 
+            split="validation",
             transform=test_transform,
             hf_ds=hf_ds,
         )
@@ -418,8 +456,8 @@ def calculate_loss(
     max_k,
 ):
     if advantage_type == "cross_entropy":
-        return F.cross_entropy(logits, targets).mean()
-    
+        return F.cross_entropy(logits, targets).mean(), None, None
+
     actions_flat, log_probs_flat = take_actions_and_log_probs_multi(
         logits=logits,
         num_samples_per_example=num_train_rollouts_per_example,
@@ -439,7 +477,9 @@ def calculate_loss(
     loss = -advantages.detach() * log_probs_flat * loss_mask
     loss = loss.sum() / loss_mask.sum()
 
-    return loss
+    rewards = (actions_flat.squeeze(1) == targets_expanded).to(torch.uint8)  # (B*K,)
+
+    return loss, actions_flat.squeeze(1), rewards
 
 
 @torch.no_grad()
@@ -717,25 +757,54 @@ def main():
     for epoch in range(1, args.epochs + 1):
         running_loss, correct, total = 0, 0, 0
 
-        for batch_idx, (inputs, targets) in enumerate(train_loader):
+        # Buffer of this epoch's training-time rollouts (imagenet256 only).
+        # Flushed to a single file at the end of the epoch.
+        log_rollouts = args.dataset_name == "imagenet256"
+        if log_rollouts:
+            rollout_buffer = {
+                "global_step": [],
+                "img_idx": [], "crop_i": [], "crop_j": [], "crop_h": [], "crop_w": [], "flip": [],
+                "target": [], "actions": [], "rewards": [],
+            }
+
+        for batch_idx, batch in enumerate(train_loader):
             model.train()
             global_step += 1
 
             if global_step % 1000 == 0:
                 print("Global step: ", global_step, " / ", args.epochs * len(train_loader))
 
+            if log_rollouts:
+                inputs, targets, img_idx, ci, cj, ch, cw, flip = batch
+            else:
+                inputs, targets = batch
+
             inputs, targets = inputs.to(device), targets.to(device)
 
             optimizer.zero_grad(set_to_none=True)
             logits = model(inputs)
 
-            loss = calculate_loss(
+            loss, actions, rewards = calculate_loss(
                 logits=logits,
                 targets=targets,
                 num_train_rollouts_per_example=args.num_train_rollouts_per_example,
                 advantage_type=advantage_type,
                 max_k=args.max_k,
             )
+
+            if log_rollouts and actions is not None:
+                K = args.num_train_rollouts_per_example
+                B = targets.size(0)
+                rollout_buffer["global_step"].append(global_step)
+                rollout_buffer["img_idx"].append(img_idx.clone())
+                rollout_buffer["crop_i"].append(ci.clone())
+                rollout_buffer["crop_j"].append(cj.clone())
+                rollout_buffer["crop_h"].append(ch.clone())
+                rollout_buffer["crop_w"].append(cw.clone())
+                rollout_buffer["flip"].append(flip.clone())
+                rollout_buffer["target"].append(targets.to(torch.int16).cpu())
+                rollout_buffer["actions"].append(actions.view(B, K).to(torch.int16).cpu())
+                rollout_buffer["rewards"].append(rewards.view(B, K).cpu())
 
             loss.backward()
 
@@ -789,33 +858,45 @@ def main():
                         }
                     )
 
-                # save_checkpoint(
-                #     state=get_checkpoint_state(
-                #         model,
-                #         optimizer,
-                #         scheduler,
-                #         epoch=args.epochs,
-                #         global_step=global_step,
-                #         best_acc=best_acc,
-                #     ),
-                #     is_best=False,
-                #     checkpoint_dir=args.checkpoint_dir,
-                #     steps=global_step,
-                # )
+        if log_rollouts:
+            os.makedirs(args.checkpoint_dir, exist_ok=True)
+            rollout_path = os.path.join(args.checkpoint_dir, f"rollouts_epoch{epoch}.pt")
+            # Stored as lists (one entry per training step), not stacked into a single
+            # tensor: the last batch of an epoch is smaller than batch_size whenever
+            # len(train_set) isn't divisible by batch_size, so entries aren't uniform shape.
+            # global_step[i] is the step at which entry i of the lists below was generated.
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "global_step": rollout_buffer["global_step"],
+                    "img_idx": rollout_buffer["img_idx"],    # list of (B,) dataset index
+                    "crop_i": rollout_buffer["crop_i"],      # list of (B,) RandomResizedCrop params
+                    "crop_j": rollout_buffer["crop_j"],      # list of (B,)
+                    "crop_h": rollout_buffer["crop_h"],      # list of (B,)
+                    "crop_w": rollout_buffer["crop_w"],      # list of (B,)
+                    "flip": rollout_buffer["flip"],          # list of (B,) horizontal flip applied
+                    "target": rollout_buffer["target"],      # list of (B,) true label
+                    "actions": rollout_buffer["actions"],    # list of (B, K) sampled class per rollout
+                    "rewards": rollout_buffer["rewards"],    # list of (B, K) 1 if correct else 0
+                },
+                rollout_path,
+            )
+            print(f"Saved {len(rollout_buffer['global_step'])} steps of training rollouts to {rollout_path}")
+            del rollout_buffer
 
-    save_checkpoint(
-        state=get_checkpoint_state(
-            model,
-            optimizer,
-            scheduler,
-            epoch=args.epochs,
-            global_step=global_step,
-            best_acc=best_acc,
-        ),
-        is_best=False,
-        checkpoint_dir=args.checkpoint_dir,
-        steps="final",
-    )
+        save_checkpoint(
+            state=get_checkpoint_state(
+                model,
+                optimizer,
+                scheduler,
+                epoch=epoch,
+                global_step=global_step,
+                best_acc=best_acc,
+            ),
+            is_best=False,
+            checkpoint_dir=args.checkpoint_dir,
+            steps=f"epoch{epoch}",
+        )
 
     # --- W&B: finish and save best model artifact ---
     if args.wandb:

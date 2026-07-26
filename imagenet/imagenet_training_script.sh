@@ -1,8 +1,10 @@
 echo "Script started"
+module load python/anaconda3/2.10.0
 conda activate maxrl
 
 export HF_HUB_HTTP_TIMEOUT=300
 export HF_HUB_ENABLE_HF_TRANSFER=1
+export HF_HOME=/work/nvme/bhxl/jgu3/hf_cache
 
 LEARNING_RATE=0.1
 SEED=69
@@ -26,9 +28,9 @@ python -m verl.cifar10_experiments.sampling_based_rl_objective_experiments \
     --seed $SEED \
     --model-type resnet \
     --model-depth 50 \
-    --data-dir /home/ftajwar/data/imagenet \
+    --data-dir /work/nvme/bhxl/jgu3/data/imagenet \
     --dataset-name imagenet256 \
-    --checkpoint-dir /home/ftajwar/imagenet256_checkpoints/${LOSS_TYPE}_${NUM_ROLLOUTS} \
+    --checkpoint-dir /work/nvme/bhxl/jgu3/imagenet256_checkpoints/${LOSS_TYPE}_${NUM_ROLLOUTS} \
     --wandb_runname ${LOSS_TYPE}_${NUM_ROLLOUTS}_lr_${LEARNING_RATE} \
     --wandb-project imagenet256_reinforce_learning_rate_ablations \
     --eval_every_k 1000 \
