@@ -12,6 +12,16 @@ label) example -- which would mean redundantly forwarding the same image up to K
 against all B*K labels via a single gather. This is mathematically identical to
 training on every one of the B*K rollouts as an independent SFT example.
 
+--rollout-filter controls which rollouts count as SFT examples:
+  all      Every one of the B*K sampled rollouts, correct or not (the default).
+  correct  Only rollouts where the sampled action matched the true label. Note this
+           is NOT self-distillation on varied model outputs -- a "correct" rollout's
+           action is by definition equal to the true label, so this mode collapses to
+           standard cross-entropy against the true label, with each image weighted by
+           how many of its K rollouts happened to land on the correct class. Images
+           the model rarely got right at that point in the original run contribute
+           less (or nothing); images it usually got right contribute more.
+
 Usage:
     python -m verl.cifar10_experiments.rollout_sft \
         --rollout-dir /path/to/imagenet256_checkpoints/reinforce_with_p_normalization_1024 \
@@ -47,7 +57,16 @@ class RolloutReplayDataset(IterableDataset):
     """
     Streams saved training-time rollouts (rollouts_epoch{N}.pt files) in exact original
     order. Each yielded item is one full original training step:
-        (images: (B, 3, crop_size, crop_size), actions: (B, K), epoch: int, step: int)
+        (images: (B, 3, crop_size, crop_size), labels: (B, L), weights: (B, L),
+         epoch: int, step: int)
+
+    labels/weights depend on rollout_filter:
+      "all"     labels = all K sampled actions (B, K); weights = all ones. Loss/metrics
+                computed over this reduce to an unweighted mean over every rollout.
+      "correct" labels = the true target repeated once per image (B, 1); weights = how
+                many of that image's K rollouts were correct (B, 1). See module
+                docstring for why this collapses to weighted true-label training
+                rather than distillation on varied sampled outputs.
 
     Rollout files are read one epoch at a time and dropped before the next is loaded,
     so at most one ~4GB epoch file is held in memory. Files on disk are only ever read
@@ -56,12 +75,15 @@ class RolloutReplayDataset(IterableDataset):
     Must be used with num_workers=0: multiple DataLoader workers would interleave steps
     non-deterministically, breaking the exact-order guarantee.
     """
-    def __init__(self, rollout_dir, hf_ds, start_epoch, end_epoch, crop_size, mean, std):
+    def __init__(self, rollout_dir, hf_ds, start_epoch, end_epoch, crop_size, mean, std,
+                 rollout_filter="all"):
+        assert rollout_filter in ("all", "correct")
         self.rollout_dir = rollout_dir
         self.ds = hf_ds["train"]
         self.start_epoch = start_epoch
         self.end_epoch = end_epoch
         self.crop_size = crop_size
+        self.rollout_filter = rollout_filter
         self.to_tensor = T.ToTensor()
         self.normalize = T.Normalize(mean=mean, std=std)
 
@@ -86,6 +108,15 @@ class RolloutReplayDataset(IterableDataset):
                 flip = rollouts["flip"][step_idx]
                 actions = rollouts["actions"][step_idx]  # (B, K)
 
+                if self.rollout_filter == "all":
+                    labels = actions
+                    weights = torch.ones_like(actions, dtype=torch.float32)
+                else:
+                    target = rollouts["target"][step_idx]              # (B,)
+                    rewards = rollouts["rewards"][step_idx]             # (B, K)
+                    labels = target.unsqueeze(1)                       # (B, 1)
+                    weights = rewards.sum(dim=1, keepdim=True).float()  # (B, 1): correct-rollout count
+
                 B = img_idx.shape[0]
                 images = torch.empty(B, 3, self.crop_size, self.crop_size)
                 for b in range(B):
@@ -96,7 +127,7 @@ class RolloutReplayDataset(IterableDataset):
                         self.crop_size, self.to_tensor, self.normalize,
                     )
 
-                yield images, actions, epoch, int(rollouts["global_step"][step_idx])
+                yield images, labels, weights, epoch, int(rollouts["global_step"][step_idx])
 
             del rollouts
 
@@ -109,6 +140,10 @@ def parse_args():
                          help="Where to save SFT checkpoints (one per source epoch replayed)")
     parser.add_argument("--start-epoch", type=int, default=1)
     parser.add_argument("--end-epoch", type=int, default=20)
+    parser.add_argument("--rollout-filter", type=str, default="all", choices=["all", "correct"],
+                         help="'all': every sampled rollout is an SFT example. "
+                              "'correct': only rollouts where the sampled action matched the "
+                              "true label (see module docstring for what this collapses to)")
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--momentum", type=float, default=0.9)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -165,6 +200,7 @@ def main():
         crop_size=224,
         mean=mean,
         std=std,
+        rollout_filter=args.rollout_filter,
     )
     # batch_size=None: the dataset already yields one complete training batch per item
     # (one original step's worth of images+labels) -- don't let DataLoader re-batch it.
@@ -204,7 +240,7 @@ def main():
             "sft/global_step": global_step,
         })
 
-    for images, actions, source_epoch, source_step in loader:
+    for images, labels, weights, source_epoch, source_step in loader:
         model.train()
         global_step += 1
 
@@ -223,24 +259,28 @@ def main():
             current_epoch = source_epoch
 
         images = images.to(device)
-        actions = actions.to(device).long()  # (B, K)
+        labels = labels.to(device).long()    # (B, L)
+        weights = weights.to(device)         # (B, L)
 
         optimizer.zero_grad(set_to_none=True)
-        # Why one forward pass instead of B*K: every one of the K rollouts for a given
-        # image is a *different sampled label for the same image* (K=1024 samples drawn
-        # from that image's softmax distribution at rollout time), so its logits are
-        # identical across all K of them. Naively treating each rollout as its own SFT
-        # example would mean forwarding the same image up to 1024 times per step --
-        # for the full run that's ~26 billion redundant forward passes. Instead we
-        # forward each of the B unique images once and use gather to pull out
-        # log p(action_k | image_b) for every (b, k) pair from that single (B, 1000)
-        # logits tensor. Averaging -log_probs.gather(1, actions) over all B*K entries is
-        # mathematically identical to averaging a per-rollout cross-entropy loss computed
-        # one rollout at a time (verified numerically in scratchpad testing) -- this is
-        # purely a compute/memory optimization, not an approximation.
+        # Why one forward pass instead of one per label: every column of `labels` for a
+        # given image is a label attached to that *same* image (in "all" mode, K distinct
+        # sampled actions; in "correct" mode, a single repeated true label), so its logits
+        # are identical across all of them. Naively treating each label as its own SFT
+        # example would mean forwarding the same image once per label -- for "all" mode
+        # over the full run that's ~26 billion redundant forward passes. Instead we
+        # forward each of the B unique images once and use a weighted gather to pull out
+        # log p(label | image_b) for every (b, l) pair from that single (B, 1000) logits
+        # tensor. In "all" mode every weight is 1, so this is a plain mean over all B*K
+        # rollouts -- mathematically identical to averaging a per-rollout loss computed
+        # one rollout at a time (verified numerically in scratchpad testing). In "correct"
+        # mode weights are the per-image correct-rollout counts, so this is a weighted
+        # mean against the true label. Either way this is purely a compute/memory
+        # optimization, not an approximation.
         logits = model(images)                        # (B, 1000) -- one forward pass
         log_probs = F.log_softmax(logits, dim=1)
-        loss = -log_probs.gather(1, actions).mean()    # mean over all B*K rollout labels
+        weight_sum = weights.sum().clamp(min=1e-6)     # guards the (extremely unlikely) all-zero-weight step
+        loss = -(log_probs.gather(1, labels) * weights).sum() / weight_sum
 
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -248,10 +288,10 @@ def main():
         scheduler.step()
 
         with torch.no_grad():
-            # accuracy of the model's *current* prediction against the rollouts' own
-            # sampled labels (not ground truth) -- for monitoring only
+            # weighted accuracy of the model's *current* prediction against `labels`
+            # (rollout-sampled in "all" mode, true label in "correct" mode) -- monitoring only
             pred = logits.argmax(1)
-            acc_vs_rollouts = (pred.unsqueeze(1) == actions).float().mean().item()
+            acc_vs_rollouts = ((pred.unsqueeze(1) == labels).float() * weights).sum().item() / weight_sum.item()
 
         if global_step % 1000 == 0:
             print(
